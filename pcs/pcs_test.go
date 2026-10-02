@@ -23,11 +23,23 @@ import (
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/hex"
+	"encoding/pem"
 	"math/big"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-tdx-guest/abi"
+	pb "github.com/google/go-tdx-guest/proto/tdx"
+	"github.com/google/go-tdx-guest/testing/testdata"
+)
+
+var (
+	testPPID   = bytes.Repeat([]byte{0x41}, ppidSize)
+	testPCEID  = bytes.Repeat([]byte{0x42}, pceIDSize)
+	testFMSPC  = bytes.Repeat([]byte{0x43}, fmspcSize)
+	testPIID   = bytes.Repeat([]byte{0x44}, piidSize)
+	testCPUSvn = bytes.Repeat([]byte{0x01}, cpuSvnSize)
 )
 
 func TestPckCrlURL(t *testing.T) {
@@ -54,7 +66,7 @@ func TestQeIdentityURL(t *testing.T) {
 	}
 }
 
-func createExtension(t *testing.T, oid asn1.ObjectIdentifier, value []byte) pkix.Extension {
+func createExtension(t testing.TB, oid asn1.ObjectIdentifier, value []byte) pkix.Extension {
 	t.Helper()
 	valueBytes, err := asn1.Marshal(value)
 	if err != nil {
@@ -144,10 +156,10 @@ func testPCKCert(t *testing.T, exts PckExtensions) *x509.Certificate {
 
 func TestParsePckCertExtension(t *testing.T) {
 	expectedExts := PckExtensions{
-		PPID:  hex.EncodeToString(bytes.Repeat([]byte{0x41}, ppidSize)),
-		PCEID: hex.EncodeToString(bytes.Repeat([]byte{0x42}, pceIDSize)),
-		FMSPC: hex.EncodeToString(bytes.Repeat([]byte{0x43}, fmspcSize)),
-		PIID:  hex.EncodeToString(bytes.Repeat([]byte{0x44}, piidSize)),
+		PPID:  hex.EncodeToString(testPPID),
+		PCEID: hex.EncodeToString(testPCEID),
+		FMSPC: hex.EncodeToString(testFMSPC),
+		PIID:  hex.EncodeToString(testPIID),
 	}
 
 	cert := testPCKCert(t, expectedExts)
@@ -160,4 +172,188 @@ func TestParsePckCertExtension(t *testing.T) {
 	if !cmp.Equal(*exts, expectedExts) {
 		t.Errorf("ParsePckCertExtension() = %v, want %v", *exts, expectedExts)
 	}
+}
+
+// sgxExtensionFromQuote returns the raw SGX extension payload of the PCK leaf
+// certificate embedded in rawQuote.
+func sgxExtensionFromQuote(f *testing.F, rawQuote []byte) []byte {
+	f.Helper()
+	quote, err := abi.QuoteToProto(rawQuote)
+	if err != nil {
+		f.Fatalf("QuoteToProto() failed: %v", err)
+	}
+	var chain []byte
+	switch q := quote.(type) {
+	case *pb.QuoteV4:
+		chain = q.GetSignedData().GetCertificationData().GetQeReportCertificationData().GetPckCertificateChainData().GetPckCertChain()
+	case *pb.QuoteV5:
+		chain = q.GetSignedData().GetCertificationData().GetQeReportCertificationData().GetPckCertificateChainData().GetPckCertChain()
+	default:
+		f.Fatalf("unexpected quote type %T", quote)
+	}
+	block, _ := pem.Decode(chain)
+	if block == nil {
+		f.Fatal("pem.Decode() found no PCK leaf certificate")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		f.Fatalf("x509.ParseCertificate() failed: %v", err)
+	}
+	ext, err := findMatchingExtension(cert.Extensions, OidSgxExtension)
+	if err != nil {
+		f.Fatalf("findMatchingExtension() failed: %v", err)
+	}
+	return ext.Value
+}
+
+// certWithSgxExt returns a certificate whose SGX extension value is data,
+// padded with dummy extensions to the count PckCertificateExtensions requires.
+func certWithSgxExt(data []byte) *x509.Certificate {
+	extensions := []pkix.Extension{
+		{
+			Id:    OidSgxExtension,
+			Value: data,
+		},
+	}
+	for i := 1; i < pckCertExtensionSize; i++ {
+		extensions = append(extensions, pkix.Extension{
+			Id: asn1.ObjectIdentifier{1, 2, 840, i},
+		})
+	}
+	return &x509.Certificate{
+		Extensions: extensions,
+	}
+}
+
+// minimalSgxExtension returns an SGX extension with only the four required
+// sub-extensions.
+func minimalSgxExtension(t testing.TB) []byte {
+	t.Helper()
+	payload, err := asn1.Marshal([]pkix.Extension{
+		createExtension(t, OidPPID, testPPID),
+		createExtension(t, OidPCEID, testPCEID),
+		createExtension(t, OidFMSPC, testFMSPC),
+		createExtension(t, OidPIID, testPIID),
+	})
+	if err != nil {
+		t.Fatalf("asn1.Marshal() failed: %v", err)
+	}
+	return payload
+}
+
+// fullSgxExtension returns an SGX extension that also carries the TCB
+// sub-extension, with SVN component i set to i, PCESVN 11 and CPUSVN testCPUSvn.
+func fullSgxExtension(t testing.TB) []byte {
+	t.Helper()
+	tcbComponents := make([]pkix.AttributeTypeAndValue, 0, tcbExtensionSize)
+	for i := 1; i <= tcbComponentSize; i++ {
+		tcbComponents = append(tcbComponents, pkix.AttributeTypeAndValue{
+			Type:  sgxTcbComponentOid(i),
+			Value: i,
+		})
+	}
+	tcbComponents = append(tcbComponents,
+		pkix.AttributeTypeAndValue{
+			Type:  OidPCESvn,
+			Value: 11,
+		},
+		pkix.AttributeTypeAndValue{
+			Type:  OidCPUSvn,
+			Value: testCPUSvn,
+		},
+	)
+	// asn1.Marshal encodes struct fields in order as a SEQUENCE, same as a
+	// slice, which lets the TCB element have a different shape.
+	type tcbExt struct {
+		ID    asn1.ObjectIdentifier
+		Value []pkix.AttributeTypeAndValue
+	}
+	payload, err := asn1.Marshal(struct {
+		PPID  pkix.Extension
+		TCB   tcbExt
+		PCEID pkix.Extension
+		FMSPC pkix.Extension
+		PIID  pkix.Extension
+	}{
+		PPID: pkix.Extension{
+			Id:    OidPPID,
+			Value: testPPID,
+		},
+		TCB: tcbExt{
+			ID:    OidTCB,
+			Value: tcbComponents,
+		},
+		PCEID: pkix.Extension{
+			Id:    OidPCEID,
+			Value: testPCEID,
+		},
+		FMSPC: pkix.Extension{
+			Id:    OidFMSPC,
+			Value: testFMSPC,
+		},
+		PIID: pkix.Extension{
+			Id:    OidPIID,
+			Value: testPIID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("asn1.Marshal() failed: %v", err)
+	}
+	return payload
+}
+
+func FuzzPckCertificateExtensions(f *testing.F) {
+	seeds := [][]byte{
+		minimalSgxExtension(f),
+		fullSgxExtension(f),
+		// Real Intel payloads carry sub-extensions (SGX Type, Configuration)
+		// the synthetic ones don't.
+		sgxExtensionFromQuote(f, testdata.RawQuote),
+		sgxExtensionFromQuote(f, testdata.RawQuoteV5),
+	}
+	for _, seed := range seeds {
+		if _, err := PckCertificateExtensions(certWithSgxExt(seed)); err != nil {
+			f.Fatalf("PckCertificateExtensions() failed on seed: %v", err)
+		}
+		f.Add(seed)
+	}
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		exts, err := PckCertificateExtensions(certWithSgxExt(data))
+		if err != nil {
+			if exts != nil {
+				t.Errorf("PckCertificateExtensions() returned non-nil extensions on error: %v", err)
+			}
+			return
+		}
+		if exts == nil {
+			t.Fatal("PckCertificateExtensions() returned nil extensions without error")
+		}
+		// Present fields are hex of a fixed-width value.
+		checkHexField := func(name, got string, size int) {
+			t.Helper()
+			if got == "" {
+				return
+			}
+			raw, err := hex.DecodeString(got)
+			if err != nil {
+				t.Errorf("%s = %q is not valid hex: %v", name, got, err)
+				return
+			}
+			if len(raw) != size {
+				t.Errorf("%s decodes to %d bytes, want %d", name, len(raw), size)
+			}
+		}
+		checkHexField("PPID", exts.PPID, ppidSize)
+		checkHexField("PCEID", exts.PCEID, pceIDSize)
+		checkHexField("FMSPC", exts.FMSPC, fmspcSize)
+		checkHexField("PIID", exts.PIID, piidSize)
+		if exts.TCB.CPUSvn != nil && len(exts.TCB.CPUSvn) != cpuSvnSize {
+			t.Errorf("TCB.CPUSvn length = %d, want %d", len(exts.TCB.CPUSvn), cpuSvnSize)
+		}
+		if exts.TCB.CPUSvnComponents != nil && len(exts.TCB.CPUSvnComponents) != tcbComponentSize {
+			t.Errorf("TCB.CPUSvnComponents length = %d, want %d", len(exts.TCB.CPUSvnComponents), tcbComponentSize)
+		}
+	})
 }
